@@ -1,6 +1,6 @@
 streamlit 
-speech_recognition
+speech-recognition
 pyttsx3
-langchain_community 
-langchain_core
-langchain_ollama 
+langchain-community 
+langchain-core
+langchain-ollama 
