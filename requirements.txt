@@ -1,5 +1,5 @@
 streamlit 
-speech-recognition
+speechrecognition
 pyttsx3
 langchain-community 
 langchain-core
