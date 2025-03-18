@@ -1,0 +1,6 @@
+streamlit 
+speech_recognition
+pyttsx3
+langchain_community 
+langchain_core
+langchain_ollama 
