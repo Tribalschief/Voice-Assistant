@@ -1,0 +1,92 @@
+import cv2
+import time
+import pytesseract
+from datetime import datetime
+from picamera2 import Picamera2
+from RPLCD.gpio import CharLCD
+import RPi.GPIO as GPIO
+
+# GPIO mode
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+
+# LCD setup
+lcd = CharLCD(
+    numbering_mode=GPIO.BCM,
+    cols=16,
+    rows=2,
+    pin_rs=7,
+    pin_e=8,
+    pins_data=[25, 24, 23, 12]
+)
+
+# Camera setup
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (1280, 720)}))
+picam2.start()
+
+def capture_image():
+    frame = picam2.capture_array()
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+def extract_plate(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.bilateralFilter(gray, 11, 90, 90)
+    edges = cv2.Canny(blur, 30, 200)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:30]:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            x, y, w, h = cv2.boundingRect(c)
+            return image[y:y+h, x:x+w]
+    return None
+
+def recognize_plate(plate_img):
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    cv2.imshow("Detected Plate", plate_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    text = pytesseract.image_to_string(thresh, config='--psm 7')
+    return ''.join(e for e in text if e.isalnum())
+
+def main():
+    lcd.clear()
+    lcd.write_string("Capturing...")
+    print("[INFO] Capturing image")
+
+    time.sleep(1)
+    img = capture_image()
+
+    lcd.clear()
+    lcd.write_string("Processing...")
+    print("[INFO] Processing image")
+
+    plate = extract_plate(img)
+    if plate is not None:
+        text = recognize_plate(plate)
+        if text:
+            print(f"[INFO] Plate Text: {text}")
+            lcd.clear()
+            lcd.write_string("Loading...")
+            time.sleep(1)
+            lcd.clear()
+            lcd.write_string(text[:16])  # Truncate if longer than 16 chars
+        else:
+            print("[WARN] Text not recognized")
+            lcd.clear()
+            lcd.write_string("Plate Not Clear")
+    else:
+        print("[WARN] No plate found")
+        lcd.clear()
+        lcd.write_string("No Plate Found")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        GPIO.cleanup()
+        lcd.clear()
+        lcd.write_string("Stopped")
+        print("[INFO] Interrupted by user")
