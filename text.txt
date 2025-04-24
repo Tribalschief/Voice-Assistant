@@ -244,3 +244,48 @@ if __name__ == "__main__":
         lcd.write_string("System Stopped")
         print("[INFO] System manually stopped")
         cv2.destroyAllWindows()
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////
+
+import RPi.GPIO as GPIO
+import time
+
+servo_pin = 18  # Use GPIO 18 (Pin 12)
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(servo_pin, GPIO.OUT)
+
+# Set PWM frequency to 50Hz (standard for servos)
+pwm = GPIO.PWM(servo_pin, 50)
+pwm.start(0)
+
+def set_angle(angle):
+    duty_cycle = 2 + (angle / 18)  # Convert angle to duty cycle
+    GPIO.output(servo_pin, True)
+    pwm.ChangeDutyCycle(duty_cycle)
+    time.sleep(0.5)
+    GPIO.output(servo_pin, False)
+    pwm.ChangeDutyCycle(0)
+
+try:
+    while True:
+        angle = float(input("Enter angle (0 to 180): "))
+        if 0 <= angle <= 180:
+            set_angle(angle)
+        else:
+            print("Angle must be between 0 and 180.")
+except KeyboardInterrupt:
+    print("Program stopped")
+finally:
+    pwm.stop()
+    GPIO.cleanup()
