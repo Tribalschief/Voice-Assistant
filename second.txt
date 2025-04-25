@@ -90,3 +90,119 @@ if __name__ == "__main__":
         lcd.clear()
         lcd.write_string("Stopped")
         print("[INFO] Interrupted by user")
+
+
+import cv2
+import numpy as np
+import pytesseract
+import RPi.GPIO as GPIO
+import time
+from picamera2 import Picamera2
+from RPLCD.gpio import CharLCD
+
+# --- GPIO Setup ---
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+
+BUZZ_PIN = 18
+BARRIER_PIN = 17
+GPIO.setup(BUZZ_PIN, GPIO.OUT)
+GPIO.setup(BARRIER_PIN, GPIO.OUT)
+
+# --- LCD 1602A Setup (Without I2C) ---
+lcd = CharLCD(
+    numbering_mode=GPIO.BCM,
+    cols=16,
+    rows=2,
+    pin_rs=7,
+    pin_e=8,
+    pins_data=[25, 24, 23, 12]
+)
+
+# --- PiCamera2 Setup ---
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (1280, 720)}))
+picam2.start()
+
+def capture_image():
+    frame = picam2.capture_array()
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+def plate_extraction(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.bilateralFilter(gray, 11, 90, 90)
+    edges = cv2.Canny(blur, 30, 200)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:30]
+
+    for c in cnts:
+        perimeter = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * perimeter, True)
+        if len(approx) == 4:
+            x, y, w, h = cv2.boundingRect(c)
+            return image[y:y+h, x:x+w]
+    return None
+
+def ocr_processing(plate):
+    text = pytesseract.image_to_string(plate, config='--psm 7')
+    return ''.join(e for e in text if e.isalnum())
+
+def check_database(plate_text):
+    try:
+        with open('Database.txt', 'r') as f:
+            return any(plate_text in line for line in f)
+    except FileNotFoundError:
+        print("[ERROR] Database file not found!")
+        return False
+
+def control_barrier(state):
+    GPIO.output(BARRIER_PIN, state)
+    time.sleep(1) if state else time.sleep(0.5)
+
+def lcd_display(line1, line2=""):
+    lcd.clear()
+    lcd.write_string(line1[:16])
+    if line2:
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(line2[:16])
+
+def main():
+    print("🚗 ANPR System Started... Press 'q' to Quit.")
+    lcd_display("ANPR System", "Ready")
+
+    while True:
+        frame = capture_image()
+        plate = plate_extraction(frame)
+
+        if plate is not None:
+            plate_text = ocr_processing(plate)
+
+            if plate_text:
+                print(f"Detected Plate: {plate_text}", end=' ')
+                lcd_display("Plate: " + plate_text)
+
+                if check_database(plate_text):
+                    print("[REGISTERED] ✅ Opening Barrier...")
+                    lcd_display("Plate: " + plate_text, "Access Granted")
+                    GPIO.output(BUZZ_PIN, GPIO.HIGH)
+                    control_barrier(GPIO.HIGH)
+                    time.sleep(0.5)
+                    GPIO.output(BUZZ_PIN, GPIO.LOW)
+                    control_barrier(GPIO.LOW)
+                else:
+                    print("[UNREGISTERED] ❌ Access Denied!")
+                    lcd_display("Plate: " + plate_text, "Access Denied")
+                    GPIO.output(BUZZ_PIN, GPIO.HIGH)
+                    time.sleep(0.2)
+                    GPIO.output(BUZZ_PIN, GPIO.LOW)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    print("Shutting Down...")
+    lcd_display("System Stopped")
+    picam2.stop()
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
