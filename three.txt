@@ -129,3 +129,102 @@ if __name__ == "__main__":
         lcd.clear()
         lcd.write_string("Stopped")
         print("[INFO] Stopped by user.")
+///////////////////////////////////////////////
+# -*- coding: utf-8 -*-
+import cv2
+import numpy as np
+import pytesseract
+import RPi.GPIO as GPIO
+import time
+from picamera2 import Picamera2
+
+# GPIO Setup
+GPIO.setwarnings(False)  # Disable warnings
+GPIO.setmode(GPIO.BCM)
+
+BUZZ_PIN = 18
+BARRIER_PIN = 17
+GPIO.setup(BUZZ_PIN, GPIO.OUT)
+GPIO.setup(BARRIER_PIN, GPIO.OUT)
+
+# Initialize Picamera2
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (1280, 720)}))
+picam2.start()
+
+def capture_image():
+    """Capture an image using Picamera2 and return as an OpenCV frame."""
+    frame = picam2.capture_array()
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+def plate_extraction(image):
+    """Extract license plate from the given image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.bilateralFilter(gray, 11, 90, 90)
+    edges = cv2.Canny(blur, 30, 200)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:30]
+
+    for c in cnts:
+        perimeter = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * perimeter, True)
+        if len(approx) == 4:
+            x, y, w, h = cv2.boundingRect(c)
+            return image[y:y+h, x:x+w]
+    return None
+
+def ocr_processing(plate):
+    """Recognize text from the extracted plate."""
+    text = pytesseract.image_to_string(plate, config='--psm 7')
+    return ''.join(e for e in text if e.isalnum())
+
+def check_database(plate_text):
+    """Check if the plate number exists in the database."""
+    try:
+        with open('Database.txt', 'r') as f:
+            return any(plate_text in line for line in f)
+    except FileNotFoundError:
+        print("[ERROR] Database file not found!")
+        return False
+
+def control_barrier(state):
+    """Open or close the barrier using GPIO."""
+    GPIO.output(BARRIER_PIN, state)
+    time.sleep(1) if state else time.sleep(0.5)
+
+def main():
+    print("?? ANPR System Started... Press 'q' to Quit.")
+
+    while True:
+        frame = capture_image()
+        plate = plate_extraction(frame)
+
+        if plate is not None:
+            plate_text = ocr_processing(plate)
+
+            if plate_text:
+                print(f"Detected Plate: {plate_text}", end=' ')
+                if check_database(plate_text):
+                    print("[REGISTERED] ? Opening Barrier...")
+                    GPIO.output(BUZZ_PIN, GPIO.HIGH)
+                    control_barrier(GPIO.HIGH)
+                    time.sleep(0.5)
+                    GPIO.output(BUZZ_PIN, GPIO.LOW)
+                    control_barrier(GPIO.LOW)
+                else:
+                    print("[UNREGISTERED] ? Access Denied!")
+                    GPIO.output(BUZZ_PIN, GPIO.HIGH)
+                    time.sleep(0.2)
+                    GPIO.output(BUZZ_PIN, GPIO.LOW)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    print("Shutting Down...")
+    picam2.stop()
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
+
