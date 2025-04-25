@@ -5,6 +5,12 @@ from datetime import datetime
 from picamera2 import Picamera2
 from RPLCD.gpio import CharLCD
 import RPi.GPIO as GPIO
+from csv import writer
+import numpy as np
+
+# --- Configuration ---
+debug = True
+MAX_RETRIES = 3
 
 # GPIO setup
 GPIO.setwarnings(False)
@@ -26,39 +32,56 @@ picam2.configure(picam2.create_preview_configuration(main={"size": (1280, 720)})
 picam2.start()
 
 def capture_image():
-    # Capture one frame and convert to BGR
     frame = picam2.capture_array()
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 def extract_plate(image):
-    # Convert to grayscale and apply filters
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 90, 90)
     edges = cv2.Canny(blur, 30, 200)
 
-    # Find contours to locate number plate
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
         if len(approx) == 4:
-            x, y, w, h = cv2.boundingRect(contour)
-            return image[y:y+h, x:x+w]
+            x, y, w, h = cv2.boundingRect(approx)
+            aspect_ratio = w / float(h)
+            if 2 < aspect_ratio < 6:
+                return image[y:y+h, x:x+w]
     return None
 
 def recognize_plate(plate_img):
-    # Preprocess for OCR
-    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    try:
+        plate_img = cv2.resize(plate_img, (400, 100))
+        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 11, 17, 17)
+        gray = cv2.equalizeHist(gray)
 
-    # Show plate for confirmation
-    cv2.imshow("Detected Plate", plate_img)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 19, 9
+        )
 
-    # OCR
-    text = pytesseract.image_to_string(thresh, config='--psm 7')
-    return ''.join(char for char in text if char.isalnum())
+        if debug:
+            cv2.imshow("Plate", plate_img)
+            cv2.imshow("Threshold", thresh)
+            cv2.waitKey(1000)
+            cv2.destroyAllWindows()
+
+        config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        text = pytesseract.image_to_string(thresh, config=config)
+        text = ''.join(char for char in text if char.isalnum())
+        return text.strip()
+    except Exception as e:
+        if debug:
+            print("[ERROR] OCR failed:", e)
+        return ""
+
+def log_plate(text):
+    with open("plate_log.csv", "a", newline="") as file:
+        csv_writer = writer(file)
+        csv_writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text])
 
 def main():
     lcd.clear()
@@ -72,16 +95,23 @@ def main():
     lcd.write_string("Processing...")
     print("[INFO] Processing image...")
 
-    plate = extract_plate(image)
+    plate = None
+    for attempt in range(MAX_RETRIES):
+        plate = extract_plate(image)
+        if plate is not None:
+            break
+        time.sleep(0.5)
+
     if plate is not None:
         text = recognize_plate(plate)
         if text:
             lcd.clear()
             lcd.write_string("Loading...")
             print(f"[INFO] Plate text: {text}")
+            log_plate(text)
             time.sleep(1)
             lcd.clear()
-            lcd.write_string(text[:16])  # Show first 16 characters on LCD
+            lcd.write_string(text[:16])
         else:
             lcd.clear()
             lcd.write_string("Plate Not Clear")
