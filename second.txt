@@ -10,6 +10,7 @@ import RPi.GPIO as GPIO
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
 
+
 # LCD setup
 lcd = CharLCD(
     numbering_mode=GPIO.BCM,
@@ -116,6 +117,7 @@ BARRIER_PIN = 17
 GPIO.setup(BUZZ_PIN, GPIO.OUT)
 GPIO.setup(BARRIER_PIN, GPIO.OUT)
 
+time.sleep(0.5)
 # --- LCD 1602A Setup (Without I2C) ---
 lcd = CharLCD(
     numbering_mode=GPIO.BCM,
@@ -125,7 +127,8 @@ lcd = CharLCD(
     pin_e=8,
     pins_data=[25, 24, 23, 12]
 )
-
+time.sleep(0.5)
+lcd.clear()
 # --- PiCamera2 Setup ---
 picam2 = Picamera2()
 picam2.configure(picam2.create_preview_configuration(main={"size": (1280, 720)}))
@@ -178,9 +181,10 @@ def main():
     lcd_display("ANPR System", "Ready")
 
     while True:
+
         frame = capture_image()
         plate = plate_extraction(frame)
-
+       cv2.imshow("Frame", frame)
         if plate is not None:
             plate_text = ocr_processing(plate)
 
@@ -203,14 +207,17 @@ def main():
                     time.sleep(0.2)
                     GPIO.output(BUZZ_PIN, GPIO.LOW)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        key = cv2.waitKey(1) & 0xFF
+if key == ord('q'):
+    break
 
     print("Shutting Down...")
     lcd_display("System Stopped")
     picam2.stop()
     GPIO.cleanup()
 
+cv2.destroyAllWindows()
 if __name__ == "__main__":
     main()
+
 
