@@ -479,7 +479,8 @@ def lcd_display(line1, line2=""):
 
 def main():
     print("🚗 ANPR System Started...")
-    print("Press Ctrl+C to Quit.")
+    # Update instruction for quitting if using imshow
+    print("Press 'q' in the video window to Quit.")
     lcd_display("ANPR System", "Initializing...")
     time.sleep(1)
     lcd_display("ANPR System", "Ready")
@@ -490,16 +491,19 @@ def main():
 
     try:
         while True:
-            frame = capture_image()
-            if frame is None:
-                time.sleep(0.1)
-                continue
+            # <<< Start of the loop block >>>
+            frame = capture_image() # Indentation Level 1
+            if frame is None:      # Indentation Level 1
+                time.sleep(0.1)    # Indentation Level 2
+                continue  
+            
 
             extracted_plate_img = plate_extraction(frame)
 
             # --- Optional: Display main frame ---
-            # cv2.imshow("ANPR Feed", frame)
-
+            cv2.imshow("ANPR Feed", frame)
+           display_frame = frame.copy()         # Indentation Level 1
+            cv2.imshow("ANPR Feed", display_frame)
             if extracted_plate_img is not None:
                 plate_text = ocr_processing(extracted_plate_img)
 
@@ -541,9 +545,9 @@ def main():
 
             # --- Handle quitting ---
             # If using cv2.imshow, waitKey is needed. Otherwise, rely on Ctrl+C
-            # key = cv2.waitKey(1) & 0xFF
-            # if key == ord('q'):
-            #    break
+             key = cv2.waitKey(1) & 0xFF
+             if key == ord('q'):
+               break
             # Minimal delay to prevent 100% CPU usage if no plate found
             time.sleep(0.05)
 
