@@ -590,3 +590,8 @@ if __name__ == "__main__":
              pass # Create empty file
 
     main()
+
+Traceback (most recent call last):
+  File "/home/ahmedyk/Project/lcdthirdtry.py", line 275
+    cv2.imshow("Frame", frame)
+IndentationError: unexpected indent
