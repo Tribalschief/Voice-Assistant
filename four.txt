@@ -979,15 +979,103 @@ except Exception as e:
         def cursor_pos(self, pos): pass
     lcd = DummyLCD()
 
+import cv2
+import numpy as np
+import pytesseract
+import RPi.GPIO as GPIO # Will work if on Pi, otherwise will fail gracefully on GPIO parts
+import time
+from picamera2 import Picamera2 # Will work if on Pi & installed
+from RPLCD.gpio import CharLCD # Will work if on Pi & installed & wired
+import re
+import os # For saving debug images
+
+# --- Configuration Constants (Tune These LATER, defaults are for debugging) ---
+DEBUG = True
+DEBUG_PATH = "debug_images"
+
+# Plate Extraction (Relaxed for Debugging)
+CANNY_LOW_THRESHOLD = 50
+CANNY_HIGH_THRESHOLD = 150
+CONTOUR_CANDIDATES = 25
+APPROX_EPSILON = 0.025 # Slightly more permissive
+MIN_PLATE_ASPECT_RATIO_DEBUG = 0.8 # Very permissive
+MAX_PLATE_ASPECT_RATIO_DEBUG = 8.0 # Very permissive
+MIN_PLATE_AREA_DEBUG = 50        # Very permissive, good for small/distant plates
+
+# OCR Processing (Relaxed for Debugging)
+OCR_TARGET_HEIGHT = 60
+ADAPTIVE_THRESH_BLOCK_SIZE = 19 # Must be odd
+ADAPTIVE_THRESH_C = 9
+TESSERACT_PSM_DEBUG = 8 # Try 8 (single word), 6 (uniform block), 7 (single line), 11 (sparse text)
+MIN_PLATE_TEXT_LENGTH_DEBUG = 1 # Allow even single characters for debug
+TESSERACT_CHAR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+# System Behavior
+DEBOUNCE_DISPLAY_TIME = 1
+PROCESS_COOLDOWN = 10
+RESET_TIMEOUT = 15
+BARRIER_OPEN_DURATION = 5
+
+# --- Path to your Test Image ---
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!  IMPORTANT: CHANGE THIS TO THE ACTUAL PATH TO YOUR IMAGE   !!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+TEST_IMAGE_PATH = "path/to/your/lamborghini.jpg" # E.g., "/home/pi/images/lamborghini.jpg" or "lamborghini.jpg" if in same folder
+
+
+# --- GPIO Setup ---
+try:
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    BUZZ_PIN = 18
+    BARRIER_PIN = 17
+    GPIO.setup(BUZZ_PIN, GPIO.OUT)
+    GPIO.setup(BARRIER_PIN, GPIO.OUT)
+    GPIO.output(BARRIER_PIN, GPIO.LOW)
+    GPIO.output(BUZZ_PIN, GPIO.LOW)
+    gpio_ok = True
+    print("GPIO Initialized (or skipped if not on Pi).")
+except Exception as e:
+    print(f"[WARN] GPIO setup failed (this is okay if not on a Pi): {e}")
+    gpio_ok = False
+    # Define dummy GPIO if needed for functions, though current code doesn't strictly need it if gpio_ok is false
+    class DummyGPIO:
+        HIGH = 1
+        LOW = 0
+        OUT = 1
+        BCM = 1
+        def setup(self, pin, mode): pass
+        def output(self, pin, state): pass
+        def cleanup(self): pass
+        def setwarnings(self, val): pass
+        def setmode(self, val): pass
+    GPIO = DummyGPIO()
+
+
+# --- LCD 1602A Setup ---
+try:
+    if not gpio_ok: raise RuntimeError("GPIO not available for LCD")
+    lcd = CharLCD(
+        numbering_mode=GPIO.BCM, cols=16, rows=2,
+        pin_rs=7, pin_e=8, pins_data=[25, 24, 23, 12],
+        charmap='A00', auto_linebreaks=True
+    )
+    lcd.clear()
+    lcd_ready = True
+    print("LCD Initialized Successfully.")
+except Exception as e:
+    print(f"[WARN] Failed to initialize LCD (this is okay if not on Pi/wired): {e}")
+    lcd_ready = False
+    class DummyLCD:
+        def write_string(self, text): pass
+        def clear(self): pass
+        def cursor_pos(self, pos): pass
+    lcd = DummyLCD()
+
 # --- PiCamera2 Setup ---
 picam2 = None
 camera_ready = False
-# --- To test with local images instead of camera: ---
-# Set TEST_IMAGE_PATH to your image file, e.g., "lamborghini.jpg"
-# If TEST_IMAGE_PATH is None, it will use the PiCamera
-TEST_IMAGE_PATH = None # "path/to/your/lamborghini.jpg" or "path/to/your/ford.jpg"
-
-if TEST_IMAGE_PATH is None:
+if TEST_IMAGE_PATH is None: # Only setup camera if not using a test image
     try:
         picam2 = Picamera2()
         picam2.configure(picam2.create_preview_configuration(main={"size": (1024, 576)}))
@@ -996,26 +1084,35 @@ if TEST_IMAGE_PATH is None:
         print("Camera Initialized.")
         camera_ready = True
     except Exception as e:
-        print(f"[ERROR] Failed to initialize PiCamera2: {e}")
+        print(f"[WARN] Failed to initialize PiCamera2 (this is okay if not on Pi or cam not connected): {e}")
         camera_ready = False
 else:
-    print(f"Camera inactive. Using test image: {TEST_IMAGE_PATH}")
+    print(f"INFO: Camera inactive. Using test image: {TEST_IMAGE_PATH}")
+    if not os.path.exists(TEST_IMAGE_PATH):
+        print(f"[FATAL ERROR] Test image not found: {TEST_IMAGE_PATH}")
+        print("Please update the TEST_IMAGE_PATH variable with the correct file path.")
+        exit()
 
 
 # --- Debugging Helper ---
-if DEBUG and not os.path.exists(DEBUG_PATH):
-    os.makedirs(DEBUG_PATH)
+if DEBUG:
+    if not os.path.exists(DEBUG_PATH):
+        try:
+            os.makedirs(DEBUG_PATH)
+            print(f"Created debug directory: {DEBUG_PATH}")
+        except OSError as e:
+            print(f"[ERROR] Could not create debug directory {DEBUG_PATH}: {e}. Debug images will not be saved.")
+            DEBUG = False # Disable debug image saving if dir creation fails
 
 def save_debug_image(name, image_data):
     if DEBUG and image_data is not None and image_data.size > 0:
         try:
             cv2.imwrite(os.path.join(DEBUG_PATH, name), image_data)
-            print(f"[DEBUG] Saved {name}")
+            print(f"[DEBUG] Saved image: {name}")
         except Exception as e:
             print(f"[DEBUG-ERROR] Could not save {name}: {e}")
 
-
-# --- Helper Function for Perspective Transform --- (Keep as is)
+# --- Helper Function for Perspective Transform --- (Usually okay)
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -1046,96 +1143,161 @@ def perspective_transform(image, pts):
 # --- Image Processing Functions ---
 def capture_image():
     if TEST_IMAGE_PATH:
+        print(f"[DEBUG] Reading test image from: {TEST_IMAGE_PATH}")
         frame = cv2.imread(TEST_IMAGE_PATH)
         if frame is None:
-            print(f"[ERROR] Could not read test image: {TEST_IMAGE_PATH}")
+            print(f"[ERROR] Could not read test image: {TEST_IMAGE_PATH}. Check path and file.")
             return None
-        return frame # Assume BGR
+        return frame
     elif camera_ready and picam2:
         frame = picam2.capture_array("main")
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         return frame
+    print("[WARN] No image source available (Camera not ready and no TEST_IMAGE_PATH).")
     return None
 
 def plate_extraction(image):
-    if image is None or image.size == 0: return None
-    save_debug_image("0_original_input.png", image)
+    if image is None or image.size == 0:
+        print("[PLATE EXTRACT] Input image is empty.")
+        return None
+    save_debug_image("0_plate_extraction_input.png", image)
+    print("[PLATE EXTRACT] Starting plate_extraction...")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     save_debug_image("1_gray.png", gray)
 
     # Bilateral filter is good for noise reduction while keeping edges sharp
-    blur = cv2.bilateralFilter(gray, 9, 75, 75) # (d, sigmaColor, sigmaSpace)
-    # Or GaussianBlur:
+    # Parameters: (image, diameter of pixel neighborhood, sigmaColor, sigmaSpace)
+    # Higher sigmaColor means more colors in the neighborhood will be mixed together.
+    # Higher sigmaSpace means pixels farther out will influence each other.
+    blur = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    # Alternative: GaussianBlur
     # blur = cv2.GaussianBlur(gray, (5,5), 0)
     save_debug_image("2_blur.png", blur)
+    print(f"[PLATE EXTRACT] Applied blur. CANNY thresholds: Low={CANNY_LOW_THRESHOLD}, High={CANNY_HIGH_THRESHOLD}")
 
     edges = cv2.Canny(blur, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD)
     save_debug_image("3_edges.png", edges)
 
     cnts, _ = cv2.findContours(edges.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # For debugging, draw all contours
-    if DEBUG:
-        img_with_all_contours = image.copy()
-        cv2.drawContours(img_with_all_contours, cnts, -1, (0,255,0), 1)
-        save_debug_image("4_all_contours.png", img_with_all_contours)
+    print(f"[PLATE EXTRACT] Found {len(cnts)} initial contours. Considering top {CONTOUR_CANDIDATES}.")
+
+    if not cnts:
+        print("[PLATE EXTRACT] No contours found after Canny edge detection.")
+        return None
+
+    # For debugging, draw all significant contours
+    img_with_all_contours = image.copy()
+    cv2.drawContours(img_with_all_contours, sorted(cnts, key=cv2.contourArea, reverse=True)[:50], -1, (0,255,0), 1) # Draw top 50 contours
+    save_debug_image("4_all_contours_drawn.png", img_with_all_contours)
 
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:CONTOUR_CANDIDATES]
 
-    plate_contour = None
-    img_with_candidate_contours = image.copy() # For debug
+    plate_contour_final = None # Renamed to avoid conflict
+    img_with_candidate_contours = image.copy()
 
-    for c in cnts:
+    print(f"[PLATE EXTRACT] Filtering top {len(cnts)} contours. Epsilon={APPROX_EPSILON*100}%, MinArea={MIN_PLATE_AREA_DEBUG}, AspectRange=({MIN_PLATE_ASPECT_RATIO_DEBUG}-{MAX_PLATE_ASPECT_RATIO_DEBUG})")
+    found_candidates = 0
+    for i, c in enumerate(cnts):
         perimeter = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, APPROX_EPSILON * perimeter, True)
+        num_points = len(approx)
 
-        # if 4 <= len(approx) <= 6: # More robust check, allows for slight imperfections
-        if len(approx) == 4: # Strict quadrilateral check
-            (x, y, w, h) = cv2.boundingRect(approx)
-            aspect_ratio = w / float(h) if h > 0 else 0
-            area = cv2.contourArea(approx) # Use contourArea for more accuracy than w*h
+        (x, y, w, h) = cv2.boundingRect(approx) # Get bounding box for aspect ratio
+        aspect_ratio = w / float(h) if h > 0 else 0
+        area = cv2.contourArea(approx)
 
-            if DEBUG:
-                cv2.drawContours(img_with_candidate_contours, [approx], -1, (255,0,0), 2) # Blue for candidates
-                print(f"[DEBUG] Contour: area={area:.0f}, asp_ratio={aspect_ratio:.2f}, points={len(approx)}")
+        # Draw candidate in blue
+        cv2.drawContours(img_with_candidate_contours, [approx], -1, (255,0,0), 1)
+
+        # Relaxed check for DEBUGGING
+        if (3 <= num_points <= 7 and # Allow more variation in points for debug
+            aspect_ratio >= MIN_PLATE_ASPECT_RATIO_DEBUG and
+            aspect_ratio <= MAX_PLATE_ASPECT_RATIO_DEBUG and
+            area > MIN_PLATE_AREA_DEBUG):
+
+            print(f"[PLATE EXTRACT Candidate {i+1}] PASSED: Points={num_points}, Area={area:.0f}, AspectRatio={aspect_ratio:.2f}")
+            cv2.drawContours(img_with_candidate_contours, [approx], -1, (0,0,255), 3) # Draw chosen in red thick
+            plate_contour_final = approx
+            found_candidates+=1
+            break # Found a plausible plate
+        else:
+            reason = []
+            if not (3 <= num_points <= 7) : reason.append(f"Points:{num_points}")
+            if not (aspect_ratio >= MIN_PLATE_ASPECT_RATIO_DEBUG and aspect_ratio <= MAX_PLATE_ASPECT_RATIO_DEBUG): reason.append(f"Aspect:{aspect_ratio:.2f}")
+            if not (area > MIN_PLATE_AREA_DEBUG): reason.append(f"Area:{area:.0f}")
+            print(f"[PLATE EXTRACT Candidate {i+1}] FAILED: Points={num_points}, Area={area:.0f}, AspectRatio={aspect_ratio:.2f}. Reasons: {', '.join(reason)}")
 
 
-            if MIN_PLATE_ASPECT_RATIO <= aspect_ratio <= MAX_PLATE_ASPECT_RATIO and area > MIN_PLATE_AREA:
-                plate_contour = approx
-                if DEBUG:
-                    print(f"[DEBUG] Found Plausible Plate: area={area:.0f}, asp_ratio={aspect_ratio:.2f}")
-                    cv2.drawContours(img_with_candidate_contours, [plate_contour], -1, (0,0,255), 3) # Red for selected
-                break
-    
-    save_debug_image("5_candidate_contours.png", img_with_candidate_contours)
+    save_debug_image("5_candidate_contours_drawn.png", img_with_candidate_contours)
 
-    if plate_contour is None:
-        if DEBUG: print("[DEBUG] No suitable plate contour found.")
+    if plate_contour_final is None:
+        print("[PLATE EXTRACT] No suitable plate contour found after filtering.")
         return None
     else:
-        # Draw the final chosen contour
-        img_with_final_contour = image.copy()
-        cv2.drawContours(img_with_final_contour, [plate_contour], -1, (0,255,255), 2)
-        save_debug_image("6_final_plate_contour.png", img_with_final_contour)
+        print(f"[PLATE EXTRACT] Selected a plate contour with {len(plate_contour_final)} points.")
+        # If the selected contour doesn't have 4 points, perspective transform will fail.
+        # For a robust solution, one might try to find the best 4 points from these if more exist,
+        # or use cv2.minAreaRect for a rotated rectangle. For now, this is a known limitation if not 4 points.
+        if len(plate_contour_final) != 4:
+            print(f"[WARN] Selected contour has {len(plate_contour_final)} points, not 4. Perspective transform might be inaccurate or fail.")
+            # Attempt to get a bounding rect and use its corners as a crude approximation for non-4-point contours
+            rect = cv2.minAreaRect(plate_contour_final)
+            box = cv2.boxPoints(rect)
+            approx_4_points = np.int0(box)
+            if len(approx_4_points) == 4:
+                 print("[WARN] Using minAreaRect to approximate 4 points for warp.")
+                 pts = approx_4_points.reshape(4,2)
+                 # It might be better to use the original color image portion for warping
+                 x_br, y_br, w_br, h_br = cv2.boundingRect(plate_contour_final)
+                 cropped_for_warp = image[y_br:y_br+h_br, x_br:x_br+w_br]
+                 # The pts from boxPoints might be relative to the whole image or cropped_for_warp's origin might be an issue.
+                 # This part needs careful handling if we go this route. For now, simpler:
+                 # if the number of points is not 4 perspective_transform will likely give issues.
+                 # So we just try with the points we have and let it fail if it does.
+                 # This is a key area for improvement if non-rectangular plates are common.
 
-        pts = plate_contour.reshape(4, 2)
+            else: # Still no 4 points, just try with the original
+                 pts = plate_contour_final.reshape(len(plate_contour_final),2) # This will likely fail in order_points or getPerspectiveTransform
+                 print(f"[WARN] Reshaping to {pts.shape}, order_points may fail.")
+                 # Fallback: return None if we can't reliably get 4 points for warping
+                 # print("[PLATE EXTRACT] Could not ensure 4 points for warp. Aborting extraction for this contour.")
+                 # return None
+
+            # For now, we'll just pass the points we found.
+            # The user needs to see if `order_points` and `perspective_transform` handle non-4-point input or how it fails.
+            # A simpler fallback for debug:
+            if len(plate_contour_final) !=4:
+                 print("[WARN] Cannot perform perspective warp reliably without 4 points. Trying to crop by bounding box instead (less accurate).")
+                 x, y, w, h = cv2.boundingRect(plate_contour_final)
+                 cropped_plate = image[y:y+h, x:x+w]
+                 save_debug_image("7_crude_crop_no_warp.png", cropped_plate)
+                 return cropped_plate # Not ideal, but better than nothing for OCR debug if warp fails.
+        
+        # Ideal path: contour has 4 points
+        pts = plate_contour_final.reshape(4, 2)
         warped_plate = perspective_transform(image, pts) # Use original color image for warp
 
         if warped_plate is None or warped_plate.size == 0:
-            if DEBUG: print("[DEBUG] Warped plate is empty.")
+            print("[PLATE EXTRACT] Warped plate is empty or perspective transform failed.")
             return None
         
         save_debug_image("7_warped_plate.png", warped_plate)
+        print("[PLATE EXTRACT] Plate extracted and warped successfully.")
         return warped_plate
 
 def ocr_processing(plate_image):
-    if plate_image is None or plate_image.size == 0: return ""
+    if plate_image is None or plate_image.size == 0:
+        print("[OCR] Input plate image is empty.")
+        return ""
+    print("[OCR] Starting OCR processing...")
+    save_debug_image("8_ocr_input_plate.png", plate_image)
 
-    # Resize for consistency, but ensure dimensions are valid
     target_height = OCR_TARGET_HEIGHT
     h, w = plate_image.shape[:2]
-    if h == 0: return "" # Invalid image
+    if h == 0 or w == 0:
+        print("[OCR] Invalid plate image dimensions (height or width is 0).")
+        return ""
     aspect_ratio = w / float(h)
     target_width = int(target_height * aspect_ratio)
 
@@ -1143,226 +1305,239 @@ def ocr_processing(plate_image):
     if target_width > 0 and target_height > 0:
         try:
             plate_image_resized = cv2.resize(plate_image, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
-            save_debug_image("8_ocr_resized.png", plate_image_resized)
+            save_debug_image("9_ocr_resized.png", plate_image_resized)
+            print(f"[OCR] Resized plate to {target_width}x{target_height}.")
         except cv2.error as e:
-            if DEBUG: print(f"[DEBUG-WARN] Resize failed: {e}. Using original for OCR.")
-            pass # Use original if resize fails
+            print(f"[OCR-WARN] Resize failed: {e}. Using original size for OCR.")
+            pass
     else:
-        if DEBUG: print(f"[DEBUG-WARN] Invalid target dims for OCR resize: {target_width}x{target_height}. Using original.")
-
+        print(f"[OCR-WARN] Invalid target dims for OCR resize: W={target_width}, H={target_height}. Using original size.")
 
     gray_plate = cv2.cvtColor(plate_image_resized, cv2.COLOR_BGR2GRAY)
-    save_debug_image("9_ocr_gray.png", gray_plate)
+    save_debug_image("10_ocr_gray.png", gray_plate)
 
-    # Adaptive thresholding is often better for varying lighting on plates
+    print(f"[OCR] Applying adaptive threshold: BlockSize={ADAPTIVE_THRESH_BLOCK_SIZE}, C={ADAPTIVE_THRESH_C}")
     binary_plate = cv2.adaptiveThreshold(
         gray_plate, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, # Invert: black text on white background -> white text on black
+        cv2.THRESH_BINARY_INV,
         ADAPTIVE_THRESH_BLOCK_SIZE,
         ADAPTIVE_THRESH_C
     )
     # Optional: Add some morphology (e.g., opening) to remove small noise
-    # kernel = np.ones((2,2),np.uint8)
+    # kernel_size = (2,2) # Very small kernel
+    # kernel = np.ones(kernel_size,np.uint8)
     # binary_plate = cv2.morphologyEx(binary_plate, cv2.MORPH_OPEN, kernel)
-    save_debug_image("10_ocr_binary.png", binary_plate)
+    # print(f"[OCR] Applied morphology OPEN with kernel {kernel_size}")
 
-    custom_config = f'--oem 3 --psm {TESSERACT_PSM}'
+    save_debug_image("11_ocr_binary_plate.png", binary_plate)
+
+    custom_config = f'--oem 3 --psm {TESSERACT_PSM_DEBUG}'
     if TESSERACT_CHAR_WHITELIST:
         custom_config += f' -c tessedit_char_whitelist={TESSERACT_CHAR_WHITELIST}'
+    print(f"[OCR] Tesseract config: '{custom_config}'")
 
     try:
         text = pytesseract.image_to_string(binary_plate, config=custom_config)
-        if DEBUG: print(f"[DEBUG] Raw OCR: '{text}'")
+        print(f"[OCR] Raw Tesseract Output: '{text.strip()}'")
 
         cleaned_text = text.strip()
         cleaned_text = ''.join(filter(str.isalnum, cleaned_text)).upper()
-        # More aggressive cleaning if needed:
-        # cleaned_text = re.sub(r'[^A-Z0-9]', '', cleaned_text) # Keep only A-Z, 0-9
+        print(f"[OCR] Cleaned (isalnum, upper): '{cleaned_text}'")
 
-        if DEBUG: print(f"[DEBUG] Cleaned OCR: '{cleaned_text}' (Length: {len(cleaned_text)})")
-
-        if len(cleaned_text) < MIN_PLATE_TEXT_LENGTH:
-            if DEBUG: print(f"[DEBUG] OCR text too short: '{cleaned_text}'")
+        if len(cleaned_text) < MIN_PLATE_TEXT_LENGTH_DEBUG:
+            print(f"[OCR] Cleaned text '{cleaned_text}' (len {len(cleaned_text)}) is shorter than min length {MIN_PLATE_TEXT_LENGTH_DEBUG}. Discarding.")
             return ""
+        print(f"[OCR] Final plate text: '{cleaned_text}'")
         return cleaned_text
     except pytesseract.TesseractNotFoundError:
-        print("[ERROR] Tesseract is not installed or not in your PATH.")
-        # Consider exiting or disabling OCR functionality
-        return "TESS_ERROR" # Special string to indicate Tesseract failure
+        print("[ERROR] Tesseract is not installed or not in your PATH. Please install Tesseract OCR.")
+        return "TESS_ERROR"
     except Exception as e:
-        print(f"[ERROR] OCR failed: {e}")
+        print(f"[ERROR] OCR processing failed with Tesseract: {e}")
         return ""
 
 def check_database(plate_text):
     if not plate_text or plate_text == "TESS_ERROR":
+        print(f"[DB CHECK] Invalid plate text for DB check: '{plate_text}'")
         return False
+    print(f"[DB CHECK] Checking database for: '{plate_text}'")
     try:
         with open('Database.txt', 'r') as f:
             database_plates = {line.strip().upper() for line in f if line.strip()}
-        return plate_text in database_plates
+        if plate_text in database_plates:
+            print(f"[DB CHECK] Plate '{plate_text}' FOUND in database.")
+            return True
+        else:
+            print(f"[DB CHECK] Plate '{plate_text}' NOT FOUND in database.")
+            return False
     except FileNotFoundError:
-        print("[ERROR] Database.txt file not found!")
+        print("[ERROR] Database.txt file not found! Cannot check plate.")
         try:
-            with open('Database.txt', 'w') as f: pass
-            print("[WARN] Created empty Database.txt")
-        except IOError: print("[ERROR] Could not create Database.txt")
+            with open('Database.txt', 'w') as f: pass # Create empty
+            print("[WARN] Created empty Database.txt. Plate will not be found.")
+        except IOError: print("[ERROR] Could not create Database.txt.")
         return False
     except Exception as e:
         print(f"[ERROR] Error reading database: {e}")
         return False
 
 def control_barrier(state):
-    GPIO.output(BARRIER_PIN, state)
+    if gpio_ok:
+        GPIO.output(BARRIER_PIN, state)
+        print(f"[CONTROL] Barrier set to {'HIGH (Open)' if state else 'LOW (Closed)'}")
+    else:
+        print("[CONTROL-WARN] GPIO not available, cannot control barrier.")
 
 def lcd_display(line1, line2=""):
-    if not lcd_ready: return
-    try:
-        lcd.clear()
-        lcd.cursor_pos = (0, 0)
-        lcd.write_string(str(line1)[:16])
-        if line2:
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(str(line2)[:16])
-    except Exception as e:
-        print(f"[ERROR] Failed to write to LCD: {e}")
+    if lcd_ready:
+        try:
+            lcd.clear()
+            lcd.cursor_pos = (0, 0)
+            lcd.write_string(str(line1)[:16])
+            if line2:
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string(str(line2)[:16])
+            # print(f"[LCD] Displayed: L1='{str(line1)[:16]}', L2='{str(line2)[:16]}'") # For console log of LCD
+        except Exception as e:
+            print(f"[ERROR] Failed to write to LCD: {e}")
+    # else:
+    #     print(f"[LCD-WARN] LCD not ready. Tried to display: L1='{str(line1)[:16]}', L2='{str(line2)[:16]}'")
+
 
 # ========================
 #        MAIN FUNCTION
 # ========================
 def main():
-    print("🚗 ANPR System Started...")
-    print("Press Ctrl+C in this terminal to Quit.")
-    lcd_display("ANPR System", "Initializing...")
-    time.sleep(1)
+    print("🚗 ANPR System Started (Debug Mode)...")
+    lcd_display("ANPR Debug", "Initializing...")
+    time.sleep(0.2) # Shorten for debug
 
     last_detected_plate = ""
     last_processed_plate = ""
     last_detection_time = 0
     last_process_time = 0
 
-    is_first_loop = True # To handle initial display
+    is_first_loop = True
 
     try:
         while True:
             current_time = time.time()
+            print("\n--- Main Loop Cycle Start ---")
             frame = capture_image()
 
             if frame is None:
-                if TEST_IMAGE_PATH: # If testing with an image, exit after one try
-                    print("Test image processing finished or failed to load.")
+                if TEST_IMAGE_PATH:
+                    print("FATAL: Test image specified but could not be loaded. Exiting.")
                     break
-                print("[WARN] Failed to capture frame.")
-                if is_first_loop: lcd_display("ANPR System", "Cam Error")
+                print("[WARN] Main loop: Failed to capture frame.")
+                if is_first_loop: lcd_display("ANPR Debug", "Cam Error")
                 time.sleep(0.5)
                 is_first_loop = False
                 continue
             
             if is_first_loop:
-                lcd_display("ANPR System", "Ready")
+                lcd_display("ANPR Debug", "Processing...")
                 is_first_loop = False
 
-
-            plate_found_this_cycle = False # To track if any plate region was found in this frame
+            plate_found_this_cycle = False
             extracted_plate_img = plate_extraction(frame)
 
             if extracted_plate_img is not None:
-                plate_found_this_cycle = True
+                plate_found_this_cycle = True # A region was extracted
+                print("[MAIN] Plate region extracted. Proceeding to OCR.")
                 plate_text = ocr_processing(extracted_plate_img)
 
                 if plate_text and plate_text != "TESS_ERROR":
-                    last_detection_time = current_time # Valid OCR text found
+                    print(f"[MAIN] OCR successful: '{plate_text}'")
+                    last_detection_time = current_time
 
                     if current_time - last_process_time > PROCESS_COOLDOWN:
                         if plate_text != last_processed_plate:
-                            # Display debounce for console/LCD
-                            if plate_text != last_detected_plate or \
-                               (current_time - last_detection_time > DEBOUNCE_DISPLAY_TIME): # Bug: last_detection_time was just updated, so this might not work as intended for debounce for *display*
-                                # A separate timer for display debounce might be better.
-                                # For now, let's assume last_detected_plate handles most of this.
+                            print(f"[MAIN] New plate '{plate_text}' for processing (last was '{last_processed_plate}').")
+                            lcd_display("Plate: " + plate_text, "Checking DB...")
+                            last_detected_plate = plate_text
 
-                                print(f"Detected Plate: '{plate_text}'", end=' ')
-                                lcd_display("Plate: " + plate_text, "Checking...")
-                                last_detected_plate = plate_text # Update for display debounce
-
-                                if check_database(plate_text):
-                                    print("[REGISTERED] ✅ Access Granted!")
-                                    lcd_display(plate_text, "Access Granted")
-                                    GPIO.output(BUZZ_PIN, GPIO.HIGH)
-                                    control_barrier(GPIO.HIGH)
-                                    time.sleep(0.5) # Buzzer
-                                    GPIO.output(BUZZ_PIN, GPIO.LOW)
-                                    time.sleep(BARRIER_OPEN_DURATION)
-                                    control_barrier(GPIO.LOW)
-                                    print(f"-> Processed '{plate_text}'. Cooldown.")
-                                else:
-                                    print("[UNREGISTERED] ❌ Access Denied!")
-                                    lcd_display(plate_text, "Access Denied")
+                            if check_database(plate_text):
+                                print(f"[MAIN] Plate '{plate_text}' REGISTERED. Access Granted!")
+                                lcd_display(plate_text, "Access Granted")
+                                if gpio_ok: GPIO.output(BUZZ_PIN, GPIO.HIGH)
+                                control_barrier(GPIO.HIGH)
+                                time.sleep(0.5)
+                                if gpio_ok: GPIO.output(BUZZ_PIN, GPIO.LOW)
+                                time.sleep(BARRIER_OPEN_DURATION)
+                                control_barrier(GPIO.LOW)
+                                print(f"[MAIN] Processed '{plate_text}'. Starting cooldown.")
+                            else:
+                                print(f"[MAIN] Plate '{plate_text}' UNREGISTERED. Access Denied!")
+                                lcd_display(plate_text, "Access Denied")
+                                if gpio_ok:
                                     for _ in range(3):
                                         GPIO.output(BUZZ_PIN, GPIO.HIGH); time.sleep(0.1)
                                         GPIO.output(BUZZ_PIN, GPIO.LOW); time.sleep(0.1)
-                                    time.sleep(1.5)
-                                    print(f"-> Processed '{plate_text}'. Cooldown.")
+                                time.sleep(1.5)
+                                print(f"[MAIN] Processed '{plate_text}' (denied). Starting cooldown.")
 
-                                last_processed_plate = plate_text
-                                last_process_time = current_time
-                                # last_detected_plate = "" # Resetting this might cause immediate redisplay if plate is still visible
-                                lcd_display("ANPR System", "Ready")
-                                # time.sleep(0.5) # Pause before scanning again
+                            last_processed_plate = plate_text
+                            last_process_time = current_time
+                            lcd_display("ANPR Debug", "Ready...")
+                        else:
+                            print(f"[MAIN] Plate '{plate_text}' is same as last processed ('{last_processed_plate}'). Ignoring during cooldown.")
+                    else:
+                        print(f"[MAIN] Still in cooldown from processing '{last_processed_plate}'. Time remaining: {PROCESS_COOLDOWN - (current_time - last_process_time):.1f}s")
+                elif plate_text == "TESS_ERROR":
+                     print("[MAIN] OCR process reported Tesseract error.")
+                     lcd_display("OCR Error", "Tesseract fail")
+                     # Potentially start a cooldown for this specific error to avoid spam
+                else: # OCR returned empty string
+                    print("[MAIN] OCR did not find valid text on the extracted plate region.")
+                    # Optionally update lcd_display to show "No text found" or similar
+            else: # No plate region extracted
+                print("[MAIN] No plate region extracted by plate_extraction function.")
 
-                        # else: # Same plate as last processed during cooldown, ignore.
-                        #     if DEBUG and plate_text != last_detected_plate:
-                        #         print(f"[DEBUG] Ignored '{plate_text}' (same as last processed, but current OCR differs from last displayed).")
-                        #         last_detected_plate = plate_text # Update if OCR flickers during cooldown
-                        pass
-                    # else: # Still in cooldown
-                    #     if DEBUG and plate_text != last_detected_plate:
-                    #          print(f"[DEBUG] Cooldown. OCR sees '{plate_text}', last displayed '{last_detected_plate}'.")
-                    #          last_detected_plate = plate_text # Update if OCR flickers during cooldown
-                    pass
-                # else (OCR returned empty or error):
-                #    if plate_text == "TESS_ERROR" and last_processed_plate != "TESS_ERROR": # Avoid spamming tesseract error
-                #        lcd_display("OCR Error", "Check Tesseract")
-                #        last_processed_plate = "TESS_ERROR" # Prevent spamming this message
-                #        last_process_time = current_time # Start a cooldown for this message
-                pass
 
-            # Reset logic: if NO plate *contour* found for a while
-            if not plate_found_this_cycle: # Check if a plate region was extracted this cycle
-                # Using last_detection_time (when OCR was successful) for reset logic
+            if not plate_found_this_cycle:
                 if current_time - last_detection_time > RESET_TIMEOUT:
                     if last_processed_plate != "":
-                        print(f"\nNo valid plate OCR for {RESET_TIMEOUT}s. Resetting lock for '{last_processed_plate}'.")
-                        lcd_display("ANPR System", "Ready") # Ensure LCD is Ready
+                        print(f"\n[MAIN] No valid plate OCR for {RESET_TIMEOUT}s. Resetting lock for '{last_processed_plate}'.")
+                        lcd_display("ANPR Debug", "Resetting...")
                         last_processed_plate = ""
                         last_detected_plate = ""
-                        # last_detection_time = current_time # Reset this so it doesn't immediately re-trigger
+            
+            if TEST_IMAGE_PATH:
+                print("\n--- Processed test image. Exiting main loop. ---")
+                break # Exit after processing one test image
 
-            if TEST_IMAGE_PATH: # If testing with an image, exit after one try
-                print("Test image processing loop finished.")
-                break
-
-            time.sleep(0.1) # Main loop delay
+            time.sleep(0.1) # Main loop delay if not using test image
 
     except KeyboardInterrupt:
         print("\n🛑 Ctrl+C detected. Shutting Down...")
+    except Exception as e:
+        print(f"\n💥 UNEXPECTED ERROR in main loop: {e}")
+        import traceback
+        traceback.print_exc() # Print full stack trace
     finally:
-        print("Cleaning up resources...")
-        GPIO.output(BARRIER_PIN, GPIO.LOW)
-        GPIO.output(BUZZ_PIN, GPIO.LOW)
-        lcd_display("System Stopped", "")
-        time.sleep(1)
-        if lcd_ready and isinstance(lcd, CharLCD): # Check if it's the real LCD
+        print("--- Cleaning up resources... ---")
+        if gpio_ok:
+            GPIO.output(BARRIER_PIN, GPIO.LOW)
+            GPIO.output(BUZZ_PIN, GPIO.LOW)
+        lcd_display("System OFF", "")
+        time.sleep(0.5)
+        if lcd_ready and isinstance(lcd, CharLCD):
             try: lcd.clear()
-            except Exception: pass
+            except: pass
         if camera_ready and picam2:
-            picam2.stop()
+            try: picam2.stop()
+            except: pass
             print("Camera stopped.")
-        GPIO.cleanup()
-        print("GPIO Cleaned Up. Exiting.")
+        if gpio_ok:
+            GPIO.cleanup()
+            print("GPIO Cleaned Up.")
+        print("Exiting.")
 
 # --- Initialization Checks ---
 if __name__ == "__main__":
+    print("--- System Pre-checks ---")
     try:
         tesseract_version = pytesseract.get_tesseract_version()
         print(f"Tesseract version: {tesseract_version}")
@@ -1372,16 +1547,16 @@ if __name__ == "__main__":
         print("And make sure the `pytesseract` Python library is installed (`pip install pytesseract`)")
         exit(1)
     except Exception as e:
-        print(f"[ERROR] Could not get Tesseract version: {e}")
-        # Decide if this is fatal or not, for now, let's assume it might work.
+        print(f"[ERROR] Could not get Tesseract version: {e}. OCR might fail.")
 
     try:
         with open('Database.txt', 'r') as f:
             print("Database.txt found.")
     except FileNotFoundError:
-        print("[WARNING] Database.txt not found.")
+        print("[WARNING] Database.txt not found. Creating empty file.")
         try:
-            with open('Database.txt', 'w') as f: print("  An empty Database.txt created.")
+            with open('Database.txt', 'w') as f: pass
         except IOError as e: print(f"[ERROR] Could not create Database.txt: {e}")
-
+    
+    print("--- Starting Main Application ---")
     main()
